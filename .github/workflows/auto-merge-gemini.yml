@@ -1,102 +1,60 @@
 name: Auto-merge after Gemini Review
 
 on:
-  issue_comment:
-    types: [created]
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
 
 jobs:
   auto-merge:
     runs-on: ubuntu-latest
-    if: |
-      github.event.comment.user.login == 'gemini-code-assist[bot]' &&
-      contains(github.event.comment.body, 'Summary of Changes')
     steps:
-      - name: Wait for full review
-        run: sleep 90
-
-      - name: Check review and decide
+      - name: Check open PRs for Gemini review
         uses: actions/github-script@v7
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            const issue = context.payload.issue;
-            if (!issue || !issue.pull_request) {
-              console.log('Not a PR comment, skipping');
-              return;
-            }
-            
-            const prNumber = issue.number;
-            console.log(`Processing PR #${prNumber}`);
-            
-            const { data: comments } = await github.rest.issues.listComments({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: prNumber
+            const { data: prs } = await github.rest.pulls.list({
+              owner: context.repo.owner, repo: context.repo.repo, state: 'open'
             });
-            
-            const { data: reviewComments } = await github.rest.pulls.listReviewComments({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              pull_number: prNumber
-            });
-            
-            const geminiReviewComments = reviewComments.filter(c =>
-              c.user.login === 'gemini-code-assist[bot]'
-            );
-            
-            const allText = comments.filter(c => c.user.login === 'gemini-code-assist[bot]')
-              .map(c => c.body).join(' ').toLowerCase();
-            const reviewText = geminiReviewComments.map(c => c.body).join(' ').toLowerCase();
-            const fullText = allText + ' ' + reviewText;
-            
-            const blockingKeywords = [
-              'bug', 'critical', 'security', 'vulnerability', 'injection',
-              'sql injection', 'xss', 'credential', 'password exposed',
-              'hardcoded secret', 'data leak', 'race condition'
-            ];
-            
-            const hasBlockingIssues = blockingKeywords.some(kw => fullText.includes(kw)) 
-              && geminiReviewComments.length > 0;
-            
-            const { data: pr } = await github.rest.pulls.get({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              pull_number: prNumber
-            });
-            
-            if (pr.state !== 'open') return;
 
-            if (hasBlockingIssues) {
-              console.log(`PR #${prNumber} has blocking issues, NOT merging`);
-              const issuesList = geminiReviewComments
-                .map(c => `- ${c.body.substring(0, 150)}...`)
-                .join('\n');
-              
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: prNumber,
-                body: `⚠️ **Auto-merge bloqueado**\n\nO Gemini encontrou ${geminiReviewComments.length} problema(s) no código.\n\n📋 **Problemas:**\n${issuesList}`
+            for (const pr of prs) {
+              const { data: comments } = await github.rest.issues.listComments({
+                owner: context.repo.owner, repo: context.repo.repo, issue_number: pr.number
               });
-              return;
-            }
 
-            try {
-              await github.rest.pulls.merge({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                pull_number: prNumber,
-                merge_method: 'squash'
+              const geminiReview = comments.find(c =>
+                c.user.login === 'gemini-code-assist[bot]' && c.body.includes('Summary of Changes')
+              );
+              if (!geminiReview) continue;
+
+              const alreadyProcessed = comments.find(c =>
+                c.user.login === 'github-actions[bot]' && (c.body.includes('Auto-merge') || c.body.includes('merged'))
+              );
+              if (alreadyProcessed) continue;
+
+              const { data: reviewComments } = await github.rest.pulls.listReviewComments({
+                owner: context.repo.owner, repo: context.repo.repo, pull_number: pr.number
               });
-              console.log(`PR #${prNumber} merged`);
-              
-              try {
-                await github.rest.git.deleteRef({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  ref: `heads/${pr.head.ref}`
+              const geminiIssues = reviewComments.filter(c => c.user.login === 'gemini-code-assist[bot]');
+              const issueText = geminiIssues.map(c => c.body).join(' ').toLowerCase();
+              const blocking = ['bug','critical','security','vulnerability','injection','xss','credential','hardcoded secret','data leak'];
+              const hasBlocking = blocking.some(kw => issueText.includes(kw)) && geminiIssues.length > 0;
+
+              if (hasBlocking) {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner, repo: context.repo.repo, issue_number: pr.number,
+                  body: `⚠️ **Auto-merge bloqueado** — Gemini encontrou ${geminiIssues.length} problema(s).`
                 });
-              } catch (e) {}
-            } catch (e) {
-              console.log('Could not merge:', e.message);
+                continue;
+              }
+
+              try {
+                await github.rest.pulls.merge({
+                  owner: context.repo.owner, repo: context.repo.repo, pull_number: pr.number, merge_method: 'squash'
+                });
+                try { await github.rest.git.deleteRef({ owner: context.repo.owner, repo: context.repo.repo, ref: `heads/${pr.head.ref}` }); } catch(e) {}
+                console.log(`PR #${pr.number} merged`);
+              } catch(e) {
+                console.log(`Could not merge #${pr.number}: ${e.message}`);
+              }
             }
